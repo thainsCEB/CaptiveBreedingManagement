@@ -11,8 +11,6 @@ def parse_args():
     )
     parser.add_argument("-t", "--threads", type=int, help="Number of threads to use")
     parser.add_argument("-s", required=True, help="Sample sheet in TSV format")
-    parser.add_argument("-f", help="Path to fastp")
-    parser.add_argument("-k", help="Path to Kraken2")
     parser.add_argument("-d", help="Path to Kraken2 database")
     parser.add_argument("-o", required=True, help="Output directory")
     parser.add_argument("--summary-only", action="store_true", help="Only summarize existing Kraken2 and fastp reports")
@@ -23,14 +21,14 @@ def ensure_directory(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-def run_fastp(fastp, threads, rawread1, rawread2, sampleID, outdir):
+def run_fastp(threads, rawread1, rawread2, sampleID, outdir):
     trimmed_1 = os.path.join(outdir, "trimmed_fastq", f"{sampleID}_1.trimmed.fastq.gz")
     trimmed_2 = os.path.join(outdir, "trimmed_fastq", f"{sampleID}_2.trimmed.fastq.gz")
     json_out = os.path.join(outdir, "trimmed_fastq", f"{sampleID}_fastp.json")
     html_out = os.path.join(outdir, "trimmed_fastq", f"{sampleID}_fastp.html")
 
     subprocess.run([
-        fastp, "-w", str(threads), "-i", rawread1, "-I", rawread2,
+        "fastp", "-w", str(threads), "-i", rawread1, "-I", rawread2,
         "-o", trimmed_1, "-O", trimmed_2, "-j", json_out, "-h", html_out
     ], check=True)
     return json_out
@@ -47,14 +45,14 @@ def extract_fastp_statistics(json_file):
         print(f"[Warning] Could not read fastp JSON: {json_file}. Error: {e}")
         return None, None, None
 
-def run_kraken2(kraken2, kraken2_db, threads, sampleID, outdir):
+def run_kraken2(kraken2_db, threads, sampleID, outdir):
     trimmed_1 = os.path.join(outdir, "trimmed_fastq", f"{sampleID}_1.trimmed.fastq.gz")
     trimmed_2 = os.path.join(outdir, "trimmed_fastq", f"{sampleID}_2.trimmed.fastq.gz")
     report = os.path.join(outdir, "decon_fastq", f"{sampleID}_kraken2_report.txt")
     unclassified = os.path.join(outdir, "decon_fastq", f"{sampleID}#.decon.fastq")
 
     subprocess.run([
-        kraken2, "--threads", str(threads), "--db", kraken2_db,
+        "kraken2", "--threads", str(threads), "--db", kraken2_db,
         "--report", report, "--use-names", "--unclassified-out", unclassified,
         "--paired", trimmed_1, trimmed_2
     ], check=True)
@@ -100,12 +98,10 @@ def print_summary_table(summary_data, out_file=None):
         )
         output_lines.append(line)
 
-    # Print to stdout
     print("\nContamination Summary:")
     for line in output_lines:
         print(line)
 
-    # Optionally write to file
     if out_file:
         with open(out_file, "w") as f:
             for line in output_lines:
@@ -128,8 +124,8 @@ def main():
             report_file = os.path.join(args.o, "decon_fastq", f"{sampleID}_kraken2_report.txt")
 
             if not args.summary_only:
-                json_file = run_fastp(args.f, args.threads, rawread1, rawread2, sampleID, args.o)
-                report_file = run_kraken2(args.k, args.d, args.threads, sampleID, args.o)
+                json_file = run_fastp(args.threads, rawread1, rawread2, sampleID, args.o)
+                report_file = run_kraken2(args.d, args.threads, sampleID, args.o)
 
             total_reads, filtered_reads, retained_pct = extract_fastp_statistics(json_file)
             unclassified_pct, contaminated_pct, unclassified_reads, contaminated_reads = extract_classification_percentages(
