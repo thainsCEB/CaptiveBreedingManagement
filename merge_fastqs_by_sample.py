@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 """
-Merge SRA accession FASTQs by sample name, with optional cleaning of FASTQ headers.
+Merge SRA accession FASTQs by sample name, with optional cleaning of FASTQ headers,
+and a single per-sample progress bar written to the log file.
 
-Inputs
-------
-1) Mapping file: two columns mapping SRA accessions to sample names.
-   - 1st column: SRA accession (e.g., SRR12345678, ERR..., DRR...)
-   - 2nd column: sample name
-   - Delimiters supported: tab, space, or comma.
-   - Lines beginning with '#' are ignored.
-2) Input directory: contains FASTQ/FASTQ.GZ files whose filenames include the accession.
+Features
+--------
+- Output names: <sample>_1.fastq.gz / <sample>_2.fastq.gz (paired) or <sample>.fastq.gz (single)
+- Cleaning flag (-c/--clean-fastq) to normalize FASTQ headers:
+    1) Remove 'length=.*$' from sequence headers.
+    2) Remove '@SRR.*sra.[0-9]*' from sequence headers (case-insensitive).
+    3) Replace quality header line with a bare '+'.
+- Force flag (-f/--force) to overwrite existing outputs.
+- **Per-sample** progress bar in the log: one bar per sample that advances as each source FASTQ
+  is merged (across both _1 and _2 streams, or single-end).
 
-Outputs
--------
-- A directory (default: <indir>/merged_raw_fastq) containing concatenated per-sample FASTQs:
-  * Paired-end: <sample>_1.fastq.gz and <sample>_2.fastq.gz
-  * Single-end: <sample>.fastq.gz
-- A log file with details at: merged_raw_fastq/merge_fastqs.log
-
-Cleaning mode (-c/--clean-fastq)
---------------------------------
-When enabled, each FASTQ record is normalized:
-  1) Remove 'length=.*$' from sequence header lines.
-  2) Remove '@SRR.*sra.[0-9]*' from sequence header lines (case-insensitive).
-  3) Replace the quality header line with a bare '+'.
+Log progress bar format
+-----------------------
+[##########..........] 10/20 files (50.0%) :: SampleA
+A line is appended after each source file completes merging for that sample.
 """
 
 import argparse
@@ -34,7 +28,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 # -----------------------------
 # Patterns & Utilities
@@ -46,6 +40,8 @@ ACC_RE = re.compile(r'\b(?:SRR|ERR|DRR)\d+\b', re.IGNORECASE)
 # Cleaning regexes
 SEQ_HEADER_RE_LEN = re.compile(r'\s+length=.*$', re.IGNORECASE)
 SEQ_HEADER_RE_SRR = re.compile(r'@SRR.*sra\.[0-9]*', re.IGNORECASE)
+
+BAR_WIDTH = 20  # characters for the progress bar
 
 def naturalsort_key(s: str):
     """Natural sort key (e.g., file1, file2, file10)."""
@@ -71,10 +67,21 @@ def open_out_gz(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     return gzip.open(path, 'wb', compresslevel=6)
 
-def stream_concat_to_gz(inputs: List[Path], outpath: Path, clean: bool):
+def _progress_line(done: int, total: int, label: str) -> str:
+    if total <= 0:
+        total = 1
+    frac = min(max(done / total, 0.0), 1.0)
+    filled = int(BAR_WIDTH * frac)
+    bar = '#' * filled + '.' * (BAR_WIDTH - filled)
+    pct = f"{frac * 100:.1f}%"
+    return f"[{bar}] {done}/{total} files ({pct}) :: {label}"
+
+def stream_concat_to_gz(inputs: List[Path], outpath: Path, clean: bool,
+                        file_done_cb: Callable[[], None] | None):
     """
     Concatenate FASTQs into a gzipped file.
-    If clean=True, normalize FASTQ headers as described in the module docstring.
+    If clean=True, normalize FASTQ headers.
+    Calls file_done_cb() once after finishing each source file.
     """
     if clean:
         with open_out_gz(outpath) as gzout:
@@ -89,7 +96,7 @@ def stream_concat_to_gz(inputs: List[Path], outpath: Path, clean: bool):
                         plus = fin.readline()
                         qual = fin.readline()
 
-                        # If any of the 4 lines are missing, stop to avoid malformed record
+                        # guard against malformed last record
                         if not seq or not plus or not qual:
                             break
 
@@ -107,6 +114,8 @@ def stream_concat_to_gz(inputs: List[Path], outpath: Path, clean: bool):
                         gzout.write(seq.encode('utf-8'))
                         gzout.write(plus_clean.encode('utf-8'))
                         gzout.write(qual.encode('utf-8'))
+                if file_done_cb:
+                    file_done_cb()
     else:
         with open_out_gz(outpath) as gzout:
             for f in inputs:
@@ -118,6 +127,8 @@ def stream_concat_to_gz(inputs: List[Path], outpath: Path, clean: bool):
                     with open(f, 'rb') as fin:
                         for chunk in iter(lambda: fin.read(1024 * 1024), b''):
                             gzout.write(chunk)
+                if file_done_cb:
+                    file_done_cb()
 
 def parse_mapping_file(path: Path) -> Dict[str, str]:
     """
@@ -144,7 +155,6 @@ def parse_mapping_file(path: Path) -> Dict[str, str]:
                     break
                 acc = row[0].strip()
                 smp = row[1].strip()
-                # Keep even if accession doesn't match ACC_RE; we warn later if no files are found.
                 tmp[acc] = smp
             if ok and tmp:
                 mapping = tmp
@@ -213,6 +223,24 @@ def merge_one_sample(sample: str, accessions: List[str], indir: Path, outdir: Pa
     out_r2 = outdir / f"{sample}_2.fastq.gz"
     out_se = outdir / f"{sample}.fastq.gz"
 
+    # Determine which inputs actually contribute to outputs for this sample
+    if r1_files or r2_files:
+        files_for_sample = r1_files + r2_files + unknown_files  # unknowns appended to _1 if present
+    else:
+        files_for_sample = unknown_files
+
+    sample_total = len(files_for_sample)
+    sample_done = 0
+    if sample_total > 0:
+        # Initial 0% line
+        log_lines.append(_progress_line(0, sample_total, sample))
+
+    # Shared callback to advance the single per-sample bar
+    def file_done_cb():
+        nonlocal sample_done
+        sample_done += 1
+        log_lines.append(_progress_line(sample_done, sample_total, sample))
+
     n_merged = 0
 
     if r1_files or r2_files:
@@ -222,7 +250,7 @@ def merge_one_sample(sample: str, accessions: List[str], indir: Path, outdir: Pa
             else:
                 log_lines.append(f"[INFO] Merging _1 for {sample} -> {out_r1}")
                 log_lines += [f"       + {p}" for p in r1_files]
-                stream_concat_to_gz(r1_files, out_r1, clean)
+                stream_concat_to_gz(r1_files, out_r1, clean, file_done_cb)
                 n_merged += len(r1_files)
         if r2_files:
             if out_r2.exists() and not force:
@@ -230,7 +258,7 @@ def merge_one_sample(sample: str, accessions: List[str], indir: Path, outdir: Pa
             else:
                 log_lines.append(f"[INFO] Merging _2 for {sample} -> {out_r2}")
                 log_lines += [f"       + {p}" for p in r2_files]
-                stream_concat_to_gz(r2_files, out_r2, clean)
+                stream_concat_to_gz(r2_files, out_r2, clean, file_done_cb)
                 n_merged += len(r2_files)
         if unknown_files:
             log_lines.append(f"[WARN] {len(unknown_files)} files for {sample} had unknown read side; appending to _1:")
@@ -244,7 +272,7 @@ def merge_one_sample(sample: str, accessions: List[str], indir: Path, outdir: Pa
                 else:
                     if r1_files and out_r1.exists():
                         out_r1.unlink()
-                    stream_concat_to_gz(files_to_write, out_r1, clean)
+                    stream_concat_to_gz(files_to_write, out_r1, clean, file_done_cb)
                     n_merged += len(unknown_files) if not r1_files else 0
     else:
         # Single-end
@@ -253,7 +281,7 @@ def merge_one_sample(sample: str, accessions: List[str], indir: Path, outdir: Pa
         else:
             log_lines.append(f"[INFO] Merging single-end for {sample} -> {out_se}")
             log_lines += [f"       + {p}" for p in unknown_files]
-            stream_concat_to_gz(unknown_files, out_se, clean)
+            stream_concat_to_gz(unknown_files, out_se, clean, file_done_cb)
             n_merged += len(unknown_files)
 
     return (out_r1, out_r2, n_merged)
