@@ -7,18 +7,22 @@ Features
 --------
 - Computes per-sample mean coverage from mosdepth summaries.
 - Calculates coverage ratio of a sex chromosome scaffold vs "total".
-- Infers sex with system-aware logic:
-    * ZW (birds): FEMALE has lower Z coverage (≈0.5x); MALE higher (≈1x)
-    * XY (mammals): FEMALE has higher X coverage (≈1x); MALE lower (≈0.5x)
-- Flexible sex inference triggers:
-    * Provide **either** -S/--sex-system OR -l/--sex-line to enable ratio/inference.
-    * If **only** -S is provided: auto-use Z (ZW) or X (XY) with alias search.
-    * If **only** -l is provided: ratio is computed, but sex is set to UNCERTAIN
-      (system unknown, so MALE/FEMALE rules aren’t applied).
-    * If both are omitted: sex determination is skipped.
-- Parses duplication rate from *.metrics.txt (PERCENT_DUPLICATION).
-- Parses mapping stats from samtools flagstat output.
-- Runs mosdepth & flagstat from a BAM list, or summarizes existing outputs with --summary-only.
+- Sex inference logic:
+    * ZW (birds): FEMALE has lower Z coverage (~0.5x); MALE higher (~1x).
+    * XY (mammals): FEMALE has higher X coverage (~1x); MALE lower (~0.5x).
+- Flexible triggers (ONLY ONE NEEDED):
+    * Provide **-S/--sex-system** alone → auto-uses default chromosome (Z for ZW, X for XY) with alias search.
+    * Provide **-l/--sex-line** alone → compute ratio to that scaffold; sex reported as **UNCERTAIN** (system unknown).
+    * Provide both → use both (system rules + provided scaffold, with aliasing for Z/X).
+    * Provide neither → skip sex determination.
+- Parses duplication rate from Picard *.metrics.txt (PERCENT_DUPLICATION).
+- Parses mapping stats from `samtools flagstat` output.
+- Runs mosdepth & flagstat from a BAM list, or summarizes existing outputs with `--summary-only`.
+
+Alias search
+------------
+- For ZW (Z): try Z, chrZ, SUPER_Z
+- For XY (X): try X, chrX, SUPER_X
 
 Short flags
 -----------
@@ -33,9 +37,8 @@ Short flags
 
 Notes
 -----
-- When a sex system is provided (ZW/XY) and the sex-line is not, this script will
-  try common aliases for the default chromosome (Z or X): e.g., Z, chrZ, SUPER_Z; X, chrX, SUPER_X.
-- The ratio denominator is 'total' from mosdepth summary.
+- Ratio denominator is 'total' from mosdepth summary.
+- Threshold for sex inference is fixed at 0.7 (empirical, user-requested).
 """
 
 __author__ = "Taylor Hains"
@@ -46,8 +49,8 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-from numpy import isnan
 import glob
+from numpy import isnan
 
 
 # ----------------------------
@@ -156,7 +159,9 @@ def parse_flagstat(flagstat_file: str):
 # ----------------------------
 # Sex chromosome resolution
 # ----------------------------
-def resolve_sex_chrom_name(df: pd.DataFrame, sex_system: str, sex_line: str | None) -> str | None:
+def resolve_sex_chrom_name(df: pd.DataFrame,
+                           sex_system: str | None,
+                           sex_line: str | None) -> str | None:
     """
     Decide which chromosome to use as the ratio numerator.
 
@@ -170,42 +175,39 @@ def resolve_sex_chrom_name(df: pd.DataFrame, sex_system: str, sex_line: str | No
     """
     chrom_list = df['chrom'].astype(str).tolist()
 
-    def alias_candidates(system: str, line: str):
-        # Only alias when line is Z/X (system-known) or when line is None (system-only)
-        if line is None:
+    def alias_candidates(system: str | None, line: str | None):
+        if system and not line:
             return ['Z', 'chrZ', 'SUPER_Z'] if system == 'ZW' else ['X', 'chrX', 'SUPER_X']
-        if system == 'ZW' and line.upper() == 'Z':
-            return ['Z', 'chrZ', 'SUPER_Z']
-        if system == 'XY' and line.upper() == 'X':
-            return ['X', 'chrX', 'SUPER_X']
-        return [line]
+        if system and line:
+            if system == 'ZW' and line.upper() == 'Z':
+                return ['Z', 'chrZ', 'SUPER_Z']
+            if system == 'XY' and line.upper() == 'X':
+                return ['X', 'chrX', 'SUPER_X']
+            return [line]
+        if line and not system:
+            return [line]
+        return []
 
-    if sex_system and not sex_line:
-        # system-only: try default alias set
-        for cand in alias_candidates(sex_system, None):
-            if cand in chrom_list:
-                return cand
-        return None
+    for cand in alias_candidates(sex_system, sex_line):
+        if cand in chrom_list:
+            return cand
 
-    if sex_system and sex_line:
-        for cand in alias_candidates(sex_system, sex_line):
-            if cand in chrom_list:
-                return cand
-        # exact fallback if user provided a non-Z/X specific name and it's not found
-        return sex_line if sex_line in chrom_list else None
+    # If user supplied a non-Z/X name with system, try exact
+    if sex_line and sex_line in chrom_list:
+        return sex_line
 
-    if sex_line and not sex_system:
-        # exact only; warn if missing
-        return sex_line if sex_line in chrom_list else None
-
-    # neither provided
     return None
 
 
 # ----------------------------
 # Core processing
 # ----------------------------
-def process_summary_files(summary_files, metrics_dir, mapping_dir, sex_system, sex_line, summarize=False) -> pd.DataFrame:
+def process_summary_files(summary_files,
+                          metrics_dir,
+                          mapping_dir,
+                          sex_system,
+                          sex_line,
+                          summarize=False) -> pd.DataFrame:
     rows = []
     do_sex_det = bool(sex_system) or bool(sex_line)
     ref_chrom = "total"  # denominator
@@ -232,19 +234,32 @@ def process_summary_files(summary_files, metrics_dir, mapping_dir, sex_system, s
         sex_chr_used = ''
 
         if do_sex_det:
-            # If system-only, default chromosome (Z/X) will be used internally
             resolved = resolve_sex_chrom_name(df, sex_system, sex_line)
-            sex_chr_used = resolved if resolved else (sex_line if sex_line else ('Z' if sex_system == 'ZW' else 'X' if sex_system == 'XY' else ''))
+            # For reporting: if nothing resolved, show what was attempted
+            if resolved:
+                sex_chr_used = resolved
+            else:
+                if sex_system and not sex_line:
+                    sex_chr_used = 'Z' if sex_system == 'ZW' else 'X'
+                elif sex_line:
+                    sex_chr_used = f"{sex_line} (NOT FOUND)"
+                else:
+                    sex_chr_used = ''
+
             ratio = coverage_ratio(df, resolved, ref_chrom) if resolved else np.nan
 
             if sex_system:
                 inferred_sex = infer_sex(ratio, sex_system) if resolved else 'UNCERTAIN'
+                if resolved is None:
+                    print(f"[WARN] Could not resolve sex chromosome in sample '{sample}' "
+                          f"(system={sex_system}, line={sex_line}). Ratio set to NaN; sex=UNCERTAIN.",
+                          file=sys.stderr)
             else:
                 # sex_line only (no system): cannot apply MALE/FEMALE rules
                 inferred_sex = 'UNCERTAIN'
                 if sex_line and resolved is None:
-                    print(f"[WARN] Sex scaffold '{sex_line}' not found in {sample} mosdepth summary; ratio set to NaN.",
-                          file=sys.stderr)
+                    print(f"[WARN] Sex scaffold '{sex_line}' not found in {sample} mosdepth summary; "
+                          f"ratio set to NaN; sex=UNCERTAIN.", file=sys.stderr)
                 elif sex_line:
                     print(f"[INFO] Only --sex-line provided for {sample}; reporting ratio, sex=UNCERTAIN (no system).",
                           file=sys.stderr)
@@ -351,10 +366,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-b", "--bamlist", help="List of BAM files to process (one path per line)")
     parser.add_argument("-l", "--sex-line",
-                        help="Chromosome/scaffold used for sex determination (e.g., Z or X, or a specific contig). "
-                             "When provided alone (without --sex-system), only ratio is computed and sex is UNCERTAIN.")
+                        help=("Chromosome/scaffold used for sex determination (e.g., Z or X, or a specific contig). "
+                              "When provided alone (without --sex-system), only ratio is computed and sex is UNCERTAIN."))
     parser.add_argument("-S", "--sex-system", choices=["ZW", "XY"],
-                        help="Sex chromosome system. If provided alone, uses default sex chromosome (Z or X) with alias search.")
+                        help=("Sex chromosome system. If provided alone, uses default sex chromosome "
+                              "(Z for ZW, X for XY) with alias search."))
     parser.add_argument("-t", "--threads", type=int, default=1, help="Threads for mosdepth")
     parser.add_argument("-s", "--summarize", action="store_true", help="Add summary line with means")
     parser.add_argument("-o", "--output", help="Output TSV file path")
@@ -364,6 +380,28 @@ def main():
 
     args = parser.parse_args()
 
-    # No strict coupling of -S and -l:
-    # - If neither provided: skip sex determination.
-    # - If -S only: system-aware aliasing with default
+    df = run_pipeline(args)
+
+    columns = [
+        'sample', 'sex_system', 'sex_chrom_used', 'ratio', 'infer',
+        'total_coverage', 'mean_depth', 'min_depth', 'max_depth',
+        'duplication_percent', 'total_reads', 'mapped_reads', 'mapped_percent'
+    ]
+
+    output_df = df[columns].copy()
+    output_df = output_df.round({
+        "ratio": 4,
+        "total_coverage": 4,
+        "duplication_percent": 2,
+        "mapped_percent": 2
+    })
+
+    if args.output:
+        output_df.to_csv(args.output, sep='\t', index=False)
+        print(f"Summary table written to {args.output}")
+    else:
+        print(output_df.to_csv(sep='\t', index=False))
+
+
+if __name__ == "__main__":
+    main()
