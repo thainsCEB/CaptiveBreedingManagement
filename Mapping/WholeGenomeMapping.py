@@ -46,7 +46,7 @@ def main():
     logs_dir = outdir / "logs"
 
     # Create output directories
-    for directory in [outdir, tempdir, finalbams, stats_dir, metrics_dir, logs_dir]:
+    for directory in [outdir,  finalbams, stats_dir, metrics_dir, logs_dir]:
         if not directory.exists():
             directory.mkdir(parents=True)
 
@@ -89,6 +89,10 @@ def main():
                 print("Skipping incomplete row: {}".format(row))
                 continue
             prefix, read1, read2 = row[0], row[1], row[2]
+            # Per-sample temporary directory to avoid run conflicts
+            tempdir = outdir / f"tempbam_{prefix}"
+            if not tempdir.exists():
+                tempdir.mkdir(parents=True)
             print(f"\nStarting the read alignment for {prefix}")
 
             bam = tempdir / f"{prefix}.bam"
