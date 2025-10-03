@@ -92,6 +92,90 @@ def derive_pos_from_beagle(beagle_gz: Path, out_pos: Path) -> None:
                 out.write(f"{chrom}\t{pos}\n")
 
 
+def split_beagle_to_perchr(beagle_gz: Path, outdir: Path) -> list:
+    """
+    Split a merged Beagle.gz (marker column formatted as 'CHR:POS' or 'CHR_POS')
+    into per-chromosome Beagle.gz files in `outdir` named '{CHR}.beagle.gz'.
+
+    Returns the list of chromosome names encountered (in first-seen order).
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    writers = {}  # chr -> gzip text writer
+    chrs = []
+    with gzip.open(beagle_gz, "rt") as f:
+        header = f.readline()
+        if not header:
+            raise ValueError(f"{beagle_gz} appears empty or lacks a header")
+        for line in f:
+            if not line.strip():
+                continue
+            parts = line.split()
+            marker = parts[0]
+            m = re.match(r'^([^:_\s]+)[:_](\d+)$', marker)
+            if not m:
+                # If marker column isn't in expected form, try last ':' split as fallback
+                if ':' in marker:
+                    chrom = marker.rsplit(':', 1)[0]
+                elif '_' in marker:
+                    chrom = marker.rsplit('_', 1)[0]
+                else:
+                    raise ValueError(f"Cannot parse CHR from marker '{marker}' (expected CHR:POS or CHR_POS)")
+            else:
+                chrom = m.group(1)
+            w = writers.get(chrom)
+            if w is None:
+                outpath = outdir / f"{chrom}.beagle.gz"
+                w = gzip.open(outpath, "wt")
+                w.write(header)
+                writers[chrom] = w
+                chrs.append(chrom)
+            writers[chrom].write(line)
+    # Close writers
+    for w in writers.values():
+        w.close()
+    return chrs
+
+
+
+def split_mafs_to_perchr(mafs_gz: Path, outdir: Path) -> list:
+    """
+    Split a merged ANGSD .mafs.gz into per-chromosome .mafs.gz files named '{CHR}.mafs.gz'.
+    Expects a header with 'chromo' and 'position' columns.
+    Returns the list of chromosome names encountered.
+    """
+    import gzip
+    outdir.mkdir(parents=True, exist_ok=True)
+    writers = {}  # chr -> gzip text writer
+    chrs = []
+    with gzip.open(mafs_gz, "rt") as f:
+        header = f.readline()
+        if not header:
+            raise ValueError(f"{mafs_gz} appears empty or lacks a header")
+        hdr = header.strip().split()
+        # Preferred header names; fallbacks for older outputs
+        chrom_keys = ["chromo", "chromosome"]
+        pos_keys = ["position", "pos"]
+        chrom_i = next((hdr.index(k) for k in chrom_keys if k in hdr), None)
+        pos_i = next((hdr.index(k) for k in pos_keys if k in hdr), None)
+        if chrom_i is None or pos_i is None:
+            raise ValueError(f"Could not find chromo/position columns in {mafs_gz} header: {hdr}")
+        for line in f:
+            if not line.strip():
+                continue
+            parts = line.rstrip("\n").split()
+            chrom = parts[chrom_i]
+            g = writers.get(chrom)
+            if g is None:
+                outpath = outdir / f"{chrom}.mafs.gz"
+                g = gzip.open(outpath, "wt")
+                g.write(header)
+                writers[chrom] = g
+                chrs.append(chrom)
+            writers[chrom].write(line)
+    for g in writers.values():
+        g.close()
+    return chrs
+
 def ensure_pos(perchr_dir: Path, outdir: Path, chr_name: str, verbose: bool) -> Path:
     """
     Return {outdir}/{CHR}.pos; if missing, derive from MAFS or Beagle and write it in outdir.
@@ -510,7 +594,7 @@ def main():
     global perchrd_dir, PREFIX
     ap = argparse.ArgumentParser(description="LD prune ANGSD Beagle (original CLI preserved) with logs, defaults, resume, sites, and merging.")
     ap.add_argument("-c", "--chr-list", help="Chromosome names, one per line")
-    ap.add_argument("-p", "--perchr-dir", required=True, help="Dir with per-chr ANGSD {CHR}.mafs.gz / .beagle.gz (or {prefix}.{CHR}.*) [unless -B]")
+    ap.add_argument("-p", "--perchr-dir", required=False, help="Dir with per-chr ANGSD {CHR}.mafs.gz / .beagle.gz (or {prefix}.{CHR}.*) [unless -B]")
     ap.add_argument("-o", "--outdir", required=True, help="Output directory (per-chr files & logs)")
     ap.add_argument("-B", "--single-beagle", help="Merged Beagle (plain or .gz) to split into per-chr {CHR}.beagle.gz in --outdir (not implemented here)")
     ap.add_argument("-j", "--jobs", type=int, default=1, help="Parallel jobs for BOTH ngsLD and prune_graph")
@@ -531,9 +615,38 @@ def main():
 
     args = ap.parse_args()
     # verbose default (no flag)
-    perchrd_dir = Path(args.perchr_dir).resolve()
     args.outdir = Path(args.outdir).resolve()
     (args.outdir / "logs").mkdir(parents=True, exist_ok=True)
+
+    # Determine input source: per-chr dir or single merged Beagle
+    if args.single_beagle:
+        single = Path(args.single_beagle).resolve()
+        if not single.exists():
+            ap.error(f"--single-beagle file not found: {single}")
+        print(f"[input] splitting merged Beagle -> per-chr in {args.outdir}")
+        # Create per-chr beagles in outdir and use outdir as our working per-chr dir
+        split_chrs = split_beagle_to_perchr(single, args.outdir)
+
+        # If a matching single MAFS exists (same basename, .mafs.gz), split it too
+        sname = single.name
+        if sname.endswith(".beagle.gz"):
+            mafs_single = single.with_name(sname[:-len(".beagle.gz")] + ".mafs.gz")
+        else:
+            mafs_single = single.with_suffix("").with_suffix(".mafs.gz")
+        if mafs_single.exists():
+            print(f"[input] found matching MAFS: {mafs_single.name} -> splitting per-chr")
+            split_mafs_to_perchr(mafs_single, args.outdir)
+
+        perchrd_dir = args.outdir
+        if not split_chrs:
+            ap.error("No chromosomes found when splitting the merged Beagle")
+        print(f"[input] discovered chromosomes from merged Beagle: {', '.join(split_chrs)}")
+    else:
+        if not args.perchr_dir:
+            ap.error("Provide either -p/--perchr-dir or -B/--single-beagle")
+        perchrd_dir = Path(args.perchr_dir).resolve()
+        if not perchrd_dir.exists():
+            ap.error(f"--perchr-dir not found: {perchrd_dir}")
 
     # Initial TEMP discovery to help prefix inference
     PREFIX = args.prefix or ""
@@ -555,7 +668,7 @@ def main():
 
     # TODO: implement -B split if needed (preserving CLI; not requested to change here)
     if args.single_beagle:
-        print("[warn] --single-beagle splitting is not implemented in this script.", file=sys.stderr)
+        print("[info] Using per-chr Beagles derived from merged input")
 
     # Process chromosomes (parallel)
     results = []
@@ -630,7 +743,7 @@ def main():
     # Cleanup
     if not args.keep_intermediates:
         for c in chrs:
-            for suffix in (".pos", ".ld.pruned"):  # keep original .ld from prune_graph
+            for suffix in (".pos",):  # keep original .ld and .ld.pruned from prune_graph
                 p = args.outdir / f"{c}{suffix}"
                 if p.exists(): p.unlink()
 
