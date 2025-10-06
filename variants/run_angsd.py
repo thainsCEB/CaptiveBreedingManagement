@@ -60,17 +60,15 @@ def parse_args():
     # Sharding
     p.add_argument("-c", "--chr-list", default=None,
                    help="File with one chromosome name per line; if omitted, run a single whole-genome job")
+    p.add_argument("-s", "--sites", default=None,
+                   help="Sites file to restrict analysis (-sites FILE). Used with --fixed to set -doMajorMinor 3.")
+    p.add_argument("-F", "--fixed", action="store_true", default=False,
+                   help="Toggle fixed major/minor usage; with --sites sets -doMajorMinor 3.")
 
     # Major/minor logic (mutually exclusive)
     g = p.add_mutually_exclusive_group()
     g.add_argument("-z", "--polarize", action="store_true",
                    help="Use ancestral polarization (-doMajorMinor 5); requires --anc")
-    # --sites and --fixed are separate (can be used together)
-    p.add_argument("-s", "--sites", default=None,
-                   help="Sites file to restrict analysis (-sites FILE). Used with --fixed to set -doMajorMinor 3.")
-    p.add_argument("-S", dest="sites", help=argparse.SUPPRESS)
-    p.add_argument("-F", "--fixed", action="store_true", default=False,
-               help="Toggle use of fixed major/minor info. When used together with --sites, sets -doMajorMinor 3.")
 
     # Missingness & depth (no defaults if not provided)
     p.add_argument("-m", "--missingness", default=None,
@@ -93,7 +91,8 @@ def parse_args():
     p.add_argument("--postCutoff", type=float, default=0.95,
                    help="Posterior cutoff for genotype/posterior filtering (ANGSD -postCutoff). Default: 0.95")
     p.add_argument("-N", "--ngsrelate", action="store_true", default=False,
-                   help="If set: prepare NGSrelate input by using -doGlf 3 and omitting -doGeno/geno_minDepth.")
+                   help="Prepare NGSrelate input: set -doglf 3 and omit -doGeno/geno depth/-postCutoff.")
+
     return p.parse_args()
 
 
@@ -179,21 +178,22 @@ def base_angsd_args(args, minInd_override: Optional[int], depth_pair: Optional[T
         "-doPost", "1",
         "-postCutoff", str(args.postCutoff),
         "-doGeno", "2",
-        "-geno_minDepth", str(args.genoDepth),
+        "--geno_minDepth", str(args.genoDepth),
         "-ref", args.ref,
         "-skipTriallelic", "1",
     ]
 
+
     # Adjust for NGSrelate mode
     if getattr(args, "ngsrelate", False):
-        # Switch GLF to 3
+        # Force GLF to 3
         if "-doglf" in cmd:
             i = cmd.index("-doglf")
             if i+1 < len(cmd):
                 cmd[i+1] = "3"
         else:
             cmd += ["-doglf", "3"]
-        # Remove -doGeno and any geno depth flags
+        # Remove -doGeno and geno depth flags
         while "-doGeno" in cmd:
             j = cmd.index("-doGeno")
             try:
@@ -207,22 +207,23 @@ def base_angsd_args(args, minInd_override: Optional[int], depth_pair: Optional[T
                     del cmd[j:j+2]
                 else:
                     del cmd[j:j+1]
-    ##NGSRELATE_BLOCK##
-
+        # Remove -postCutoff as well
+        while "-postCutoff" in cmd:
+            j = cmd.index("-postCutoff")
+            try:
+                del cmd[j:j+2]
+            except Exception:
+                del cmd[j]
     # Proper pairs policy (default 1; override to 0 with --allow-improper)
     if getattr(args, "allow_improper", False):
         cmd += ["-only_proper_pairs", "0"]
     else:
-        cmd += ["-only_proper_pairs", "1"]
-
-
-    # Major/minor selection
+        cmd += ["-only_proper_pairs", "1"]        # Major/minor selection
     if args.polarize:
         if not args.anc:
             raise SystemExit("--polarize requires --anc.")
         cmd += ["-doMajorMinor", "5", "-anc", args.anc]
     else:
-        # If both --sites and --fixed are provided, use -doMajorMinor 3; else 1.
         if args.sites and args.fixed:
             cmd += ["-doMajorMinor", "3", "-sites", args.sites]
         else:
@@ -377,8 +378,8 @@ def maybe_concat(outprefix_dir: Path, outprefix: str, chrs: List[str], progress_
 async def main_async():
     args = parse_args()
 
-    if args.polarize and args.fixed_sites:
-        raise SystemExit("--polarize and --fixed-sites are mutually exclusive.")
+    if args.polarize and (args.sites or args.fixed):
+        raise SystemExit("--polarize is incompatible with --sites/--fixed; choose one approach.")
 
     n_bams = count_bams(args.bamlist)
     minInd_override = compute_minInd(args.missingness, n_bams) if args.missingness is not None else None
