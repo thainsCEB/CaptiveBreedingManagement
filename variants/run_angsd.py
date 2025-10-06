@@ -69,8 +69,8 @@ def parse_args():
     p.add_argument("-s", "--sites", default=None,
                    help="Sites file to restrict analysis (-sites FILE). Used with --fixed to set -doMajorMinor 3.")
     p.add_argument("-S", dest="sites", help=argparse.SUPPRESS)
-    p.add_argument("-F", "--fixed", default=None,
-                   help="Fixed major/minor info; when provided together with --sites, sets -doMajorMinor 3.")
+    p.add_argument("-F", "--fixed", action="store_true", default=False,
+               help="Toggle use of fixed major/minor info. When used together with --sites, sets -doMajorMinor 3.")
 
     # Missingness & depth (no defaults if not provided)
     p.add_argument("-m", "--missingness", default=None,
