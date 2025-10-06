@@ -65,8 +65,12 @@ def parse_args():
     g = p.add_mutually_exclusive_group()
     g.add_argument("-z", "--polarize", action="store_true",
                    help="Use ancestral polarization (-doMajorMinor 5); requires --anc")
-    g.add_argument("-S", "--fixed-sites", default=None,
-                   help="Use fixed sites list (-doMajorMinor 3 with -sites FILE). Mutually exclusive with --polarize.")
+    # --sites and --fixed are separate (can be used together)
+    p.add_argument("-s", "--sites", default=None,
+                   help="Sites file to restrict analysis (-sites FILE). Used with --fixed to set -doMajorMinor 3.")
+    p.add_argument("-S", dest="sites", help=argparse.SUPPRESS)
+    p.add_argument("-F", "--fixed", default=None,
+                   help="Fixed major/minor info; when provided together with --sites, sets -doMajorMinor 3.")
 
     # Missingness & depth (no defaults if not provided)
     p.add_argument("-m", "--missingness", default=None,
@@ -80,6 +84,16 @@ def parse_args():
     p.add_argument("-x", "--concat", action="store_true",
                    help="Concatenate per-chrom .mafs.gz and .beagle.gz at end (only with --chr-list)")
 
+    p.add_argument("--genoDepth", type=int, default=5,
+                   help="Minimum depth per site for genotypes (maps to --geno_minDepth). Default: 5")
+    p.add_argument("--plink", action="store_true",
+                   help="If set, include -doPlink 2 in ANGSD command to emit PLINK files")
+    p.add_argument("--allow-improper", action="store_true",
+                   help="If set, use -only_proper_pairs 0. Default behavior is 1 (only proper pairs).")
+    p.add_argument("--postCutoff", type=float, default=0.95,
+                   help="Posterior cutoff for genotype/posterior filtering (ANGSD -postCutoff). Default: 0.95")
+    p.add_argument("-N", "--ngsrelate", action="store_true", default=False,
+                   help="If set: prepare NGSrelate input by using -doGlf 3 and omitting -doGeno/geno_minDepth.")
     return p.parse_args()
 
 
@@ -156,7 +170,6 @@ def base_angsd_args(args, minInd_override: Optional[int], depth_pair: Optional[T
         "-minQ", "30",
         "-remove_bads", "1",
         "-uniqueOnly", "1",
-        "-only_proper_pairs", "0",
         "-C", "50",
         "-baq", "1",
         "-minMaf", "0.05",
@@ -164,23 +177,59 @@ def base_angsd_args(args, minInd_override: Optional[int], depth_pair: Optional[T
         "-SNP_pval", "1e-6",
         "-doglf", "2",
         "-doPost", "1",
+        "-postCutoff", str(args.postCutoff),
+        "-doGeno", "2",
+        "-geno_minDepth", str(args.genoDepth),
         "-ref", args.ref,
         "-skipTriallelic", "1",
     ]
+
+    # Adjust for NGSrelate mode
+    if getattr(args, "ngsrelate", False):
+        # Switch GLF to 3
+        if "-doglf" in cmd:
+            i = cmd.index("-doglf")
+            if i+1 < len(cmd):
+                cmd[i+1] = "3"
+        else:
+            cmd += ["-doglf", "3"]
+        # Remove -doGeno and any geno depth flags
+        while "-doGeno" in cmd:
+            j = cmd.index("-doGeno")
+            try:
+                del cmd[j:j+2]
+            except Exception:
+                del cmd[j]
+        for key in ("--geno_minDepth", "--genoDepth", "-geno_minDepth", "--geno-minDepth"):
+            while key in cmd:
+                j = cmd.index(key)
+                if j+1 < len(cmd) and not cmd[j+1].startswith("-"):
+                    del cmd[j:j+2]
+                else:
+                    del cmd[j:j+1]
+    ##NGSRELATE_BLOCK##
+
+    # Proper pairs policy (default 1; override to 0 with --allow-improper)
+    if getattr(args, "allow_improper", False):
+        cmd += ["-only_proper_pairs", "0"]
+    else:
+        cmd += ["-only_proper_pairs", "1"]
+
 
     # Major/minor selection
     if args.polarize:
         if not args.anc:
             raise SystemExit("--polarize requires --anc.")
         cmd += ["-doMajorMinor", "5", "-anc", args.anc]
-    elif args.fixed_sites:
-        cmd += ["-doMajorMinor", "3", "-sites", args.fixed_sites]
-        if args.anc:
-            cmd += ["-anc", args.anc]
     else:
-        cmd += ["-doMajorMinor", "1"]
+        # If both --sites and --fixed are provided, use -doMajorMinor 3; else 1.
+        if args.sites and args.fixed:
+            cmd += ["-doMajorMinor", "3", "-sites", args.sites]
+        else:
+            cmd += ["-doMajorMinor", "1"]
         if args.anc:
             cmd += ["-anc", args.anc]
+
 
     # Only include minInd if requested
     if minInd_override is not None:
@@ -191,9 +240,9 @@ def base_angsd_args(args, minInd_override: Optional[int], depth_pair: Optional[T
         dmin, dmax = depth_pair
         cmd += ["-setMinDepthInd", str(dmin), "-setMaxDepthInd", str(dmax)]
 
+    if getattr(args, "plink", False):
+        cmd += ["-doPlink", "2"]
     return cmd
-
-
 def build_angsd_cmd_perchr(args, chr_name: str, outprefix_chr: Path,
                            minInd_override: Optional[int], depth_pair: Optional[Tuple[int, int]]) -> List[str]:
     return base_angsd_args(args, minInd_override, depth_pair) + ["-out", str(outprefix_chr), "-r", chr_name]
