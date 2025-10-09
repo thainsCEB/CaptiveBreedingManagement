@@ -515,6 +515,7 @@ def run_ngsld_for_chr(args, chr_name: str, beagle: Path, pos: Path) -> Path:
     running.unlink(missing_ok=True); done.touch()
     return ld_out
 
+
 def run_prune_graph_for_chr(args, chr_name: str, ld_tsv: Path) -> Path:
     pruned = args.outdir / f"{chr_name}.ld.pruned"
     log = args.outdir / "logs" / f"prune_graph_{chr_name}.log"
@@ -523,6 +524,23 @@ def run_prune_graph_for_chr(args, chr_name: str, ld_tsv: Path) -> Path:
     if pruned.exists() and not args.overwrite:
         print(f"[skip] prune_graph {chr_name}: exists.")
         return pruned
+
+    for m in (running, done):
+        if m.exists(): 
+            m.unlink()
+    running.touch()
+
+    # Build and run prune_graph without attempting to reference 'beagle' here
+    cmd = prune_graph_cmd(ld_tsv, pruned, args.min_dist, args.min_r2, args.threads, True)
+    print(f"[run] {chr_name} prune_graph -> {pruned.name}")
+    ret = run_cmd(cmd, log)
+    if ret != 0 or not pruned.exists():
+        running.unlink(missing_ok=True)
+        raise RuntimeError(f"prune_graph failed for {chr_name}. See log: {log}")
+
+    running.unlink(missing_ok=True)
+    done.touch()
+    return pruned
 
     for m in (running, done):
         if m.exists(): m.unlink()

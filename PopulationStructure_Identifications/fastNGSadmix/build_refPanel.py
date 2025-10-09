@@ -6,6 +6,74 @@ import os
 import gzip
 import pandas as pd
 
+
+def _strip_known_suffixes(path: str) -> str:
+    """
+    Return the path with known suffixes removed to get the common prefix.
+    Known suffixes include: .beagle.gz, .beagle, .fopt.gz, .qopt, .beagle.filter, .mafs.gz, .mafs
+    """
+    for suf in [".beagle.gz", ".beagle", ".fopt.gz", ".qopt", ".beagle.filter", ".mafs.gz", ".mafs"]:
+        if path.endswith(suf):
+            return path[:-len(suf)]
+    # If none matched, remove trailing extensions generically
+    for suf in [".gz", ".txt", ".tsv"]:
+        if path.endswith(suf):
+            return path[:-len(suf)]
+    return path
+
+def _first_existing(candidates):
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+def infer_ngsadmix_paths(args):
+    """
+    Infer paths for beagle, fopt, qopt, filter, mafs from either --in-prefix or any one of the individual files.
+    Respects already-provided args; only fills missing ones.
+    Returns a dict with keys: beagle, fopt, qopt, filter, mafs
+    """
+    prefix = None
+    # Priority: in-prefix, else derive from any provided file
+    if getattr(args, "in_prefix", None):
+        prefix = args.in_prefix
+    else:
+        for key in ["beagle","fopt","qopt","filter","mafs"]:
+            val = getattr(args, key, None)
+            if val:
+                prefix = _strip_known_suffixes(val)
+                break
+
+    if not prefix:
+        raise SystemExit("[ERROR] Provide --in-prefix OR one of --beagle/--fopt/--qopt/--filter/--mafs to infer the rest.")
+
+    paths = {
+        "beagle": getattr(args, "beagle", None),
+        "fopt": getattr(args, "fopt", None),
+        "qopt": getattr(args, "qopt", None),
+        "filter": getattr(args, "filter", None),
+        "mafs": getattr(args, "mafs", None),
+    }
+
+    # Propose candidates from prefix
+    beagle_cands = [prefix + ".beagle.gz", prefix + ".beagle"]
+    fopt_cands   = [prefix + ".fopt.gz", prefix + ".fopt"]
+    qopt_cands   = [prefix + ".qopt"]
+    filter_cands = [prefix + ".beagle.filter", prefix + ".filter"]
+    mafs_cands   = [prefix + ".mafs.gz", prefix + ".mafs"]
+
+    if paths["beagle"] is None:
+        paths["beagle"] = _first_existing(beagle_cands) or beagle_cands[0]
+    if paths["fopt"] is None:
+        paths["fopt"] = _first_existing(fopt_cands) or fopt_cands[0]
+    if paths["qopt"] is None:
+        paths["qopt"] = _first_existing(qopt_cands) or qopt_cands[0]
+    if paths["filter"] is None:
+        paths["filter"] = _first_existing(filter_cands) or filter_cands[0]
+    if paths["mafs"] is None:
+        paths["mafs"] = _first_existing(mafs_cands) or mafs_cands[0]
+
+    return paths, prefix
 def run(cmd, desc):
     print(f"[RUNNING] {desc}")
     subprocess.run(cmd, shell=True, check=True)
@@ -15,7 +83,7 @@ def decompress_gz(gz_path, out_path):
     with gzip.open(gz_path, 'rt') as fin, open(out_path, 'w') as fout:
         fout.writelines(fin)
 
-def parse_ref_beagle(tmp_beagle, filter_file, output_file="tmp.ref"):
+def parse_ref_beagle(tmp_beagle, filter_file, output_file="tmp.ref") -> bool:
     print("[INFO] Filtering and building tmp.ref")
     tmp = pd.read_csv(tmp_beagle, sep="\t", header=None, dtype=str)
     filter_df = pd.read_csv(filter_file, sep="\t", header=0, dtype=str)
@@ -31,18 +99,47 @@ def parse_ref_beagle(tmp_beagle, filter_file, output_file="tmp.ref"):
     out_df = tmp[["id", "chr", "pos", "name", "A0_freq", "A1"]]
     out_df.to_csv(output_file, sep="\t", index=False, header=False)
 
-def generate_sites_and_bed(refpanel_file, prefix):
+
+def generate_sites_and_bed(refpanel_file, prefix, mafs_file=None):
+    """
+    Write:
+      - refPanel_{prefix}.refPanel.sites => STRICTLY from .mafs(.gz) columns 1-4:
+            chr  pos  major  minor
+      - refPanel_{prefix}.refPanel.bed   => from ref panel chr/pos: chr  start  end (0-based)
+    If mafs_file is missing/unreadable, raise an error (to ensure alleles come from MAFS only).
+    """
+    import os, gzip
+    import pandas as pd
+
     print(f"[INFO] Generating .sites and .bed files from {refpanel_file}")
-    df = pd.read_csv(refpanel_file, sep="\s+|	", engine="python")
+    if not mafs_file or not os.path.exists(mafs_file):
+        raise FileNotFoundError("[ERROR] --mafs not provided or not found; the .sites must be built from MAFS.")
+
+    # Read only columns 1-4 (1-based) = 0-3 (0-based): chromo, position, major, minor
+    if str(mafs_file).endswith(".gz"):
+        with gzip.open(mafs_file, "rt") as fin:
+            mafs_df = pd.read_csv(fin, sep=r"\s+|\t", engine="python", header=0, usecols=[0,1,2,3])
+    else:
+        mafs_df = pd.read_csv(mafs_file, sep=r"\s+|\t", engine="python", header=0, usecols=[0,1,2,3])
+    mafs_df.columns = ["chr","pos","major","minor"]
+
     sites_file = f"refPanel_{prefix}.refPanel.sites"
     bed_file = f"refPanel_{prefix}.refPanel.bed"
 
-    df[["chr", "pos"]].to_csv(sites_file, sep="\t", index=False, header=False)
+    # Write sites strictly from MAFS
+    mafs_df.to_csv(sites_file, sep="\t", index=False, header=False)
+    print(f"[INFO] Wrote sites from MAFS (chr pos major minor) to {sites_file}")
 
+    # BED from the ref panel table
+    df = pd.read_csv(refpanel_file, sep=r"\s+|\t", engine="python", dtype=str)
+    cols_lower = {c.lower(): c for c in df.columns}
+    if not all(k in cols_lower for k in ("chr","pos")):
+        raise ValueError("[ERROR] ref panel table must contain 'chr' and 'pos' columns to make BED.")
+    chr_col = cols_lower["chr"]; pos_col = cols_lower["pos"]
     bed_df = pd.DataFrame({
-        "chr": df["chr"],
-        "start": df["pos"].astype(int) - 1,
-        "end": df["pos"].astype(int)
+        "chr": df[chr_col],
+        "start": df[pos_col].astype(int) - 1,
+        "end": df[pos_col].astype(int)
     })
     bed_df.to_csv(bed_file, sep="\t", index=False, header=False)
 
@@ -80,7 +177,8 @@ def main():
     parser.add_argument("--mode", choices=["ngsadmix", "admixture"], default="ngsadmix", help="Choose input mode")
     parser.add_argument("--K", type=int, required=True, help="Number of ancestry clusters")
 
-    parser.add_argument("--beagle", help="Input .beagle.gz file (NGSadmix mode)")
+    parser.add_argument("--beagle", help="Input .beagle(.gz) file (NGSadmix mode)")
+    parser.add_argument("--in-prefix", help="Prefix to infer --beagle, --fopt, --qopt, --filter, and --mafs (NGSadmix mode).")
     parser.add_argument("--filter", help=".beagle.filter file (NGSadmix mode)")
     parser.add_argument("--fopt", help=".fopt.gz file (NGSadmix mode)")
     parser.add_argument("--qopt", help=".qopt file (NGSadmix mode)")
@@ -93,8 +191,17 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "ngsadmix":
-        if not all([args.beagle, args.filter, args.fopt, args.qopt]):
-            parser.error("NGSadmix mode requires --beagle, --filter, --fopt, --qopt")
+        # Infer all required file paths from --in-prefix or any provided file
+        paths, inferred_prefix = infer_ngsadmix_paths(args)
+        args.beagle = paths["beagle"]
+        args.fopt   = paths["fopt"]
+        args.qopt   = paths["qopt"]
+        args.filter = paths["filter"]
+        args.mafs   = paths["mafs"]
+
+        # Now validate that the inferred/provided files exist where needed
+        if not all([args.beagle, args.fopt, args.qopt, args.filter]):
+            raise SystemExit("[ERROR] Could not infer all required files. Provide --in-prefix or explicit paths.")
 
         tmp_beagle = "tmp.beagle"
         tmp_fopt = "tmp.fopt"
@@ -102,6 +209,28 @@ def main():
         decompress_gz(args.fopt, tmp_fopt)
 
         out_refpanel = f"refPanel_{args.prefix}.refPanel.txt"
+        # Infer mafs_path from fopt/beagle prefixes if not provided
+        def _strip_known_suffixes(path: str) -> str:
+            for suf in [".beagle.gz",".beagle",".fopt.gz",".fopt",".qopt",".beagle.filter",".filter",".mafs.gz",".mafs"]:
+                if path.endswith(suf):
+                    return path[:-len(suf)]
+            return path
+        def _first_existing(cands):
+            import os
+            for c in cands:
+                if os.path.exists(c):
+                    return c
+            return None
+        _pref_fopt = _strip_known_suffixes(args.fopt) if getattr(args, "fopt", None) else None
+        _pref_beag = _strip_known_suffixes(args.beagle) if getattr(args, "beagle", None) else None
+        mafs_path = getattr(args, "mafs", None)
+        if not mafs_path:
+            if _pref_fopt:
+                mafs_path = _first_existing([_pref_fopt + ".mafs.gz", _pref_fopt + ".mafs"])
+            if not mafs_path and _pref_beag:
+                mafs_path = _first_existing([_pref_beag + ".mafs.gz", _pref_beag + ".mafs"])
+        if not mafs_path:
+            raise SystemExit("[ERROR] Could not infer .mafs(.gz). Provide --mafs or place it next to your .fopt/.beagle with the same prefix.")
         out_nind = f"nInd_{args.prefix}.refPanel.txt"
 
         with open(out_refpanel, "w") as f:
@@ -118,7 +247,7 @@ def main():
             f.write(" ".join([f"K{i+1}" for i in range(args.K)]) + "\n")
             f.write(" ".join(qopt.iloc[:, :args.K].sum().astype(str).tolist()) + "\n")
 
-        generate_sites_and_bed(out_refpanel, args.prefix)
+        generate_sites_and_bed(out_refpanel, args.prefix, mafs_path)
         print("[DONE] NGSadmix reference panel and cluster summary built.")
 
     elif args.mode == "admixture":
