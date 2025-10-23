@@ -1,24 +1,15 @@
 #!/usr/bin/env Rscript
 
-## Procrustes PCA plotter for fastNGSadmix-style covariances
-## - Shapes from group (col 2, legend "Group")
-## - Colors from taxa/ref (col 3, legend "Taxa")
-## - Optional ellipses per subgroup (group × taxa):
-##     --ellipses (default OFF)
-##     --exclude-ellipse=<csv>  # exact col2 or "group × taxa" OR substring in col3
-##     --marker[=<color>]       # draw ALL ellipses in one color (e.g., --marker, --marker=#FF00FF)
-##     --ellipse-style <solid|dashed|dotted>
-##     --ellipse-lwd <num>      # line width (aliases: --ellipse-width, --ellipse-size)
-## - Point sizing:
-##     --point-size <num>       # ggplot2 size for both ref & projected points
-##     --point-stroke <num>     # outline stroke for both point layers
-## - Title via --title (auto-wrapped), position via --title-align=left|center|right|0..1
-## - Text controls:
-##     --font / --font-family "<family>"
-##     --title-size <pt> --axis-title-size <pt> --axis-text-size <pt>
-##     --legend-title-size <pt> --legend-text-size <pt> --label-size <pt>
-## - Output sizing via --width, --height (inches) and --dpi
-## - Auto-install packages; only PCA figure + data tables (no barplot)
+## ================================================================
+## Procrustes PCA plotter for fastNGSadmix-style covariances (2D only)
+## - Shapes from group (legend "Group")
+## - Colors from taxa/ref (legend "Taxa")
+## - Optional ellipses per subgroup (group × taxa) with exclusions & styling
+## - Optional projected-point labels
+## - Alias file to rename taxa/group labels
+## - Legend-title flags; font and size controls
+## - Output: <out_prefix>.png, .txt, .legacy.txt
+## ================================================================
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 4) {
@@ -28,21 +19,23 @@ if (length(args) < 4) {
           "Options:\n",
           "  --label-projected                  Add text labels to projected points\n",
           "  --ellipses                         Draw ellipses for each (group × ref_taxon) subgroup\n",
-          "  --exclude-ellipse=<csv>            Exclude: exact <group> (col2), exact '<group> × <taxa>', or substring in taxa (col3)\n",
+          "  --exclude-ellipse=<csv>            Exclude exact <group> OR '<group> × <taxa>' OR substring in taxa\n",
           "  --marker[=<color>]                 Color ALL ellipses with one color (default black)\n",
           "  --ellipse-style=<solid|dashed|dotted>\n",
-          "  --ellipse-lwd=<num>                Ellipse line width (aliases: --ellipse-width, --ellipse-size)\n",
-          "  --point-size=<num>                 Point size for both layers (default 3.0)\n",
-          "  --point-stroke=<num>               Point stroke width (default 0.9)\n",
-          "  --title=<text>                     Set plot title (or: --title <text>)\n",
+          "  --ellipse-lwd=<num>                Ellipse line width\n",
+          "  --point-size=<num>                 ggplot size (default 3.0)\n",
+          "  --point-stroke=<num>               point outline stroke (default 0.9)\n",
+          "  --title=<text>                     Set plot title (auto-wrapped)\n",
           "  --title-align=<left|center|right|0..1>\n",
           "  --font=<family> | --font-family=<family>\n",
-          "  --title-size <pt>\n",
-          "  --axis-title-size <pt> --axis-text-size <pt>\n",
-          "  --legend-title-size <pt> --legend-text-size <pt>\n",
-          "  --label-size <pt>\n",
+          "  --title-size <pt> --axis-title-size <pt> --axis-text-size <pt>\n",
+          "  --legend-title-size <pt> --legend-text-size <pt> --label-size <pt>\n",
           "  --width=<in> --height=<in>         Output size in inches (defaults 7.5 × 5.8)\n",
-          "  --dpi=<n>                          Output DPI (default 300)\n")
+          "  --dpi=<n>                          Output DPI (default 300)\n",
+          "  --alias <file.tsv>                 Map old<TAB>new labels for Taxa & Group\n",
+          "  --legend-title=<text>              Set BOTH legend titles\n",
+          "  --legend-title-taxa=<text>         Set Taxa legend title\n",
+          "  --legend-title-group=<text>        Set Group legend title\n")
   quit(save = "no", status = 2)
 }
 
@@ -75,7 +68,11 @@ axis_title_size <- NA_real_
 axis_text_size  <- NA_real_
 legend_title_size <- NA_real_
 legend_text_size  <- NA_real_
-label_text_size   <- NA_real_  # default later to 3.0
+label_text_size   <- NA_real_
+
+alias_file <- NA_character_
+legend_title_color <- "Taxa"
+legend_title_shape <- "Group"
 
 parse_exclude_value <- function(val) {
   if (is.null(val) || length(val) == 0) return(character(0))
@@ -107,16 +104,16 @@ while (i <= length(args)) {
   a <- args[i]; a_next <- if (i + 1 <= length(args)) args[i+1] else NULL
   al <- tolower(gsub("^--", "", a))
 
-  if (al %in% c("label-projected", "label_projected", "label")) {
+  if (al %in% c("label-projected","label_projected","label")) {
     do_label <- TRUE
 
-  } else if (al %in% c("ellipses", "ellipse", "draw-ellipses", "draw_ellipses")) {
+  } else if (al %in% c("ellipses","ellipse","draw-ellipses","draw_ellipses")) {
     draw_ellipses <- TRUE
 
   } else if (grepl("^exclude(-ellipse)?=", al)) {
     exclude_ellipse_patterns <- c(exclude_ellipse_patterns, parse_exclude_value(sub("^[^=]*=", "", a)))
 
-  } else if (al %in% c("exclude", "exclude-ellipse", "exclude_ellipse", "excludeellipse")) {
+  } else if (al %in% c("exclude","exclude-ellipse","exclude_ellipse","excludeellipse")) {
     if (!is.null(a_next) && !startsWith(a_next, "--")) { exclude_ellipse_patterns <- c(exclude_ellipse_patterns, parse_exclude_value(a_next)); i <- i + 1 }
     else message("Warning: ", a, " provided without a value; ignoring.")
 
@@ -165,12 +162,16 @@ while (i <= length(args)) {
   } else if (grepl("^label-size(=|$)", al)) {
     val <- parse_numeric_arg(a, a_next); if (!is.na(val)) { label_text_size <- val; if (!grepl("=", a) && !startsWith(a_next, "--")) i <- i + 1 }
 
-  } else if (grepl("^width(=|$)", al)) {
-    val <- parse_numeric_arg(a, a_next); if (!is.na(val)) { out_width <- val; if (!grepl("=", a) && !startsWith(a_next, "--")) i <- i + 1 }
-  } else if (grepl("^height(=|$)", al)) {
-    val <- parse_numeric_arg(a, a_next); if (!is.na(val)) { out_height <- val; if (!grepl("=", a) && !startsWith(a_next, "--")) i <- i + 1 }
-  } else if (grepl("^dpi(=|$)", al)) {
-    val <- parse_numeric_arg(a, a_next); if (!is.na(val)) { out_dpi <- as.integer(val); if (!grepl("=", a) && !startsWith(a_next, "--")) i <- i + 1 }
+  } else if (al == "alias") {
+    if (!is.null(a_next) && !startsWith(a_next, "--")) { alias_file <- a_next; i <- i + 1 }
+    else stop("--alias requires a path to a 2-column TSV (old<TAB>new).")
+
+  } else if (grepl("^legend-title(=|$)", al)) {
+    val <- parse_string_arg(a, a_next); if (!is.na(val)) { legend_title_color <- val; legend_title_shape <- val; if (!grepl("=", a) && !startsWith(a_next, "--")) i <- i + 1 }
+  } else if (grepl("^legend-title-taxa(=|$)", al)) {
+    val <- parse_string_arg(a, a_next); if (!is.na(val)) { legend_title_color <- val; if (!grepl("=", a) && !startsWith(a_next, "--")) i <- i + 1 }
+  } else if (grepl("^legend-title-group(=|$)", al)) {
+    val <- parse_string_arg(a, a_next); if (!is.na(val)) { legend_title_shape <- val; if (!grepl("=", a) && !startsWith(a_next, "--")) i <- i + 1 }
 
   } else {
     message("Note: Unrecognized option '", a, "' (ignored).")
@@ -179,7 +180,7 @@ while (i <= length(args)) {
 }
 exclude_ellipse_patterns <- unique(tolower(exclude_ellipse_patterns))
 
-## Title wrapping to fit figure width (approx chars-per-inch ~= 10)
+## Title wrapping for 2D plot
 wrap_text <- function(s, width_chars = 60) paste(strwrap(s, width = width_chars), collapse = "\n")
 wrap_chars <- max(24, floor(out_width * 10))
 plot_title_wrapped <- wrap_text(plot_title, width_chars = wrap_chars)
@@ -203,16 +204,15 @@ ensure_pkgs <- function(pkgs) {
     install.packages(p, lib = userlib, dependencies = TRUE)
   }
 }
-base_pkgs <- c("vegan", "ggplot2", "paletteer")
-extra_pkgs <- if (do_label) c(base_pkgs, "ggrepel") else base_pkgs
-ensure_pkgs(extra_pkgs)
+base_pkgs <- c("vegan", "ggplot2", "paletteer", "ggrepel")
+ensure_pkgs(base_pkgs)
 
 suppressPackageStartupMessages({
   library(parallel)
   library(vegan)
   library(ggplot2)
   library(paletteer)
-  if (do_label) library(ggrepel)
+  library(ggrepel)
 })
 
 ## -------------------- Inputs & reference setup --------------------
@@ -256,7 +256,7 @@ pc_to_file <- function(f) {
   r  <- read.table(f, header = TRUE, check.names = FALSE)
   ee <- eigen(as.matrix(r))
   outname <- sub("_covar.txt$", "", basename(f))
-  write.table(ee$vectors[, 1:2],
+  write.table(ee$vectors[, 1:2, drop = FALSE],
               file = file.path(tmpdir, outname),
               col.names = FALSE, row.names = FALSE, quote = FALSE)
   invisible(NULL)
@@ -312,36 +312,46 @@ proj_df <- data.frame(
   stringsAsFactors = FALSE
 )
 
+## ---- Aliases (Taxa & Group) ----
+apply_alias_vec <- function(v, m) {
+  if (length(m) == 0) return(v)
+  out <- v; idx <- match(v, names(m)); rep <- !is.na(idx); out[rep] <- m[idx[rep]]; out
+}
+alias_map <- character(0)
+if (!is.na(alias_file)) {
+  a <- read.table(alias_file, header = FALSE, sep = "\t", quote = "", comment.char = "", stringsAsFactors = FALSE)
+  if (ncol(a) < 2) stop("Alias file must have at least 2 columns: old<TAB>new")
+  alias_map <- setNames(a[[2]], a[[1]])
+  ref_df$ColorPop <- apply_alias_vec(ref_df$ColorPop, alias_map)
+  proj_df$ColorPop <- apply_alias_vec(proj_df$ColorPop, alias_map)
+  ref_df$Group    <- apply_alias_vec(ref_df$Group, alias_map)
+  proj_df$Group   <- apply_alias_vec(proj_df$Group, alias_map)
+}
+
 df <- rbind(
   ref_df[,  c("Sample","PC1","PC2","Group","ColorPop")],
   proj_df[, c("Sample","PC1","PC2","Group","ColorPop")]
 )
 
-## -------------------- Subgroups & exclusions for ellipses --------------------
+## -------------------- Subgroups & ellipse exclusions --------------------
 proj_only <- subset(df, Group != "Reference")
 proj_only$GroupKey <- paste0(proj_only$Group, " × ", proj_only$ColorPop)
 
 excluded_keys <- character(0)
 if (length(exclude_ellipse_patterns)) {
-  gl <- tolower(proj_only$Group)
-  rk <- tolower(proj_only$GroupKey)
-  rt <- tolower(proj_only$ColorPop)
+  gl <- tolower(proj_only$Group); rk <- tolower(proj_only$GroupKey); rt <- tolower(proj_only$ColorPop)
   mask <- rep(FALSE, nrow(proj_only))
   for (pat in exclude_ellipse_patterns) {
     if (pat == "") next
-    mask <- mask |
-      (gl == pat) |                 # exact match on group (col2)
-      (rk == pat) |                 # exact match on combined key
-      grepl(pat, rt, fixed = TRUE)  # substring within taxa (col3)
+    mask <- mask | (gl == pat) | (rk == pat) | grepl(pat, rt, fixed = TRUE)
   }
   excluded_keys <- unique(proj_only$GroupKey[mask])
-  if (length(excluded_keys))
-    message("Excluding ellipses for: ", paste(excluded_keys, collapse = "; "))
+  if (length(excluded_keys)) message("Excluding ellipses for: ", paste(excluded_keys, collapse = "; "))
 }
 
-## -------------------- Ellipses (robust, less line-like) --------------------
+## -------------------- Ellipses (2D) --------------------
 ellipse_level <- 0.95
-ellipse_min_axis_frac <- 0.05   # >= 5% of min axis span
+ellipse_min_axis_frac <- 0.05
 global_span_x <- diff(range(c(df$PC1), na.rm = TRUE))
 global_span_y <- diff(range(c(df$PC2), na.rm = TRUE))
 min_axis <- ellipse_min_axis_frac * min(global_span_x, global_span_y)
@@ -352,9 +362,9 @@ make_cov_ellipse <- function(x, y, level = 0.95, n = 360, min_axis = 0.01) {
   Sigma <- stats::cov(cbind(x, y))
   if (!all(is.finite(Sigma))) return(NULL)
   eig <- eigen(Sigma, symmetric = TRUE)
-  lam <- pmax(eig$values, .Machine$double.eps)   # stability
+  lam <- pmax(eig$values, .Machine$double.eps)
   chi <- sqrt(stats::qchisq(level, df = 2))
-  axes <- pmax(sqrt(lam) * chi, min_axis)        # minimum axis lengths
+  axes <- pmax(sqrt(lam) * chi, min_axis)
   R <- eig$vectors %*% diag(axes, nrow = 2)
   th <- seq(0, 2*pi, length.out = n)
   pts <- t(R %*% rbind(cos(th), sin(th)))
@@ -373,13 +383,18 @@ if (draw_ellipses && nrow(proj_only)) {
       if (inherits(ell, "try-error") || is.null(ell)) ell <- NULL
     }
     if (is.null(ell)) {
-      ## Fallback small circle if single point/degenerate
       cx <- mean(sub$PC1); cy <- mean(sub$PC2)
       th <- seq(0, 2*pi, length.out = 360)
       ell <- data.frame(x = cx + default_r * cos(th), y = cy + default_r * sin(th))
     }
     ucol <- unique(sub$ColorPop)
-    ellipse_col <- if (!is.null(ellipse_force_color)) ellipse_force_color else if (length(ucol) == 1) ucol[1] else "MixedGroup"
+    ellipse_col <- if (!is.null(ellipse_force_color)) {
+      ellipse_force_color
+    } else if (length(ucol) == 1) {
+      ucol[1]
+    } else {
+      "MixedGroup"
+    }
     ell$GroupKey <- key
     ell$EllipseColor <- ellipse_col
     ellipse_list[[key]] <- ell
@@ -387,7 +402,7 @@ if (draw_ellipses && nrow(proj_only)) {
   if (length(ellipse_list)) ellipse_df <- do.call(rbind, ellipse_list)
 }
 
-## -------------------- Shapes (uniform sizes) --------------------
+## -------------------- Shapes & colors --------------------
 proj_groups <- setdiff(unique(df$Group), "Reference")
 shape_seq <- c(17, 18, 15, 8, 4)  # triangle, diamond, square, star, cross
 shape_map <- c("Reference" = 16)
@@ -395,7 +410,6 @@ if (length(proj_groups) > 0) {
   shape_map[proj_groups] <- shape_seq[((seq_along(proj_groups) - 1) %% length(shape_seq)) + 1]
 }
 
-## -------------------- Colors palette --------------------
 color_levels <- unique(c(ref_df$ColorPop, proj_df$ColorPop, if (nrow(ellipse_df)) as.character(ellipse_df$EllipseColor)))
 n_cols <- length(color_levels)
 if (n_cols <= 10) {
@@ -412,8 +426,7 @@ if (nrow(ellipse_df)) ellipse_df$EllipseColor <- factor(ellipse_df$EllipseColor,
 
 ## -------------------- Save data tables --------------------
 write.table(df[, c("Sample", "PC1", "PC2", "Group", "ColorPop")],
-            paste0(out_prefix, ".txt"),
-            col.names = TRUE, row.names = FALSE, quote = FALSE)
+            paste0(out_prefix, ".txt"), col.names = TRUE, row.names = FALSE, quote = FALSE)
 
 legacy_points <- rbind(
   data.frame(ColorPop = ref_df$ColorPop,
@@ -430,7 +443,7 @@ legacy_points <- rbind(
 write.table(legacy_points, paste0(out_prefix, ".legacy.txt"),
             col.names = FALSE, row.names = FALSE, quote = FALSE)
 
-## -------------------- Plot --------------------
+## -------------------- 2D Plot (ggplot) --------------------
 set.seed(1)
 base_family <- ifelse(is.null(font_family), "", font_family)
 
@@ -465,8 +478,8 @@ p <- p +
     aes(x = PC1, y = PC2, color = ColorPop, shape = Group),
     size = point_size, stroke = point_stroke, alpha = 0.98
   ) +
-  scale_colour_manual(values = pal_vec, name = "Taxa") +
-  scale_shape_manual(values = shape_map,  name = "Group") +
+  scale_colour_manual(values = pal_vec, name = legend_title_color) +
+  scale_shape_manual(values = shape_map,  name = legend_title_shape) +
   guides(
     shape  = guide_legend(override.aes = list(size = point_size, stroke = point_stroke, alpha = 1)),
     colour = guide_legend(override.aes = list(size = point_size, alpha = 1))
@@ -477,7 +490,6 @@ p <- p +
   ggtitle(plot_title_wrapped) +
   theme_minimal(base_size = 12, base_family = base_family)
 
-## ---- Apply detailed theme (font, sizes, title alignment) ----
 th <- theme(
   legend.position = "right",
   panel.grid.minor = element_blank(),
@@ -486,14 +498,13 @@ th <- theme(
 if (!is.null(font_family)) th <- th + theme(text = element_text(family = font_family))
 if (is.finite(title_size))        th <- th + theme(plot.title   = element_text(face = "bold", hjust = title_align_hjust, size = title_size, family = font_family))
 if (is.finite(axis_title_size))   th <- th + theme(axis.title   = element_text(size = axis_title_size))
-if (is.finite(axis_text_size))    th <- th + theme(axis.text    = element_text(size = axis_text_size))
+if (is.finite(axis_text_size))    th <- th + theme(axis.text    = element_text_size))
 if (is.finite(legend_title_size)) th <- th + theme(legend.title = element_text(size = legend_title_size))
 if (is.finite(legend_text_size))  th <- th + theme(legend.text  = element_text(size = legend_text_size))
 p <- p + th
 
-## ---- Optional labels ----
-label_size_final <- if (is.finite(label_text_size)) label_text_size else 3.0
 if (do_label) {
+  label_size_final <- if (is.finite(label_text_size)) label_text_size else 3.0
   p <- p +
     ggrepel::geom_text_repel(
       data = subset(df, Group != "Reference"),

@@ -1,205 +1,188 @@
 #!/usr/bin/env python3
-import os, re, sys, argparse, shutil, statistics, datetime
-from pathlib import Path
+# -----------------------------------------------------------------------------
+# Title: Run NGSadmix across K, estimate best K (Evanno), and extract best Q
+# Description:
+#   - Runs NGSadmix for K = [minK..maxK] with N replicates each (always with -printInfo 1).
+#   - Parses log-likelihoods, computes Evanno DeltaK, and writes evanno_deltaK.tsv.
+#   - Writes bestK.txt (Evanno result) and copies best .qopt for chosen K(s).
+# Author: Taylor Hains
+# Date: 2025-10-17
+# -----------------------------------------------------------------------------
 
-LOG_PATTERNS = {
-    "cv": [
-        re.compile(r"CV\s*error\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)"),
-        re.compile(r"cross[-\s]?validation\s*error\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)"),
-    ],
-    "llh": [
-        re.compile(r"(?:like|log[-\s]?lik|loglik)\s*[:=]\s*(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)"),
-        re.compile(r"best\s+like(?:lihood)?\s*[:=]\s*(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)"),
-        re.compile(r"Final\s+log[-\s]?lik(?:elihood)?\s*[:=]\s*(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)"),
-    ],
-}
+import os
+import re
+import shutil
+import argparse
+import subprocess
+import pandas as pd
+import numpy as np
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Estimate best K from NGSadmix runs; copy .fopt and .filter for the best K value(s) with flexible naming.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("--indir", "-i", default=".", help="Input directory to scan for logs, .fopt and .filter files")
-    p.add_argument("--outdir", "-o", default="bestK", help="Directory to write outputs into")
-    gk = p.add_argument_group("K selection")
-    gk.add_argument("--k-list", "-K", type=str, default="", help="Comma-separated Ks to consider (e.g., 2,3,4,5). If empty, infer from files named like *K<k>*")
-    gk.add_argument("--k-min", type=int, default=None, help="Minimum K to consider (inclusive) if inferring from files")
-    gk.add_argument("--k-max", type=int, default=None, help="Maximum K to consider (inclusive) if inferring from files")
-    p.add_argument("--log-glob", default="*.log", help="Glob to find log files used to score K (contains CV or LLH)")
-    p.add_argument("--stat", choices=["cv","llh"], default="cv", help="Statistic to optimize: cv=minimize, llh=maximize")
-    p.add_argument("--aggregate", choices=["mean","median","min","max","last"], default="mean", help="Aggregation across replicates")
-    p.add_argument("--n-best", type=int, default=1, help="How many top K values to keep")
-    p.add_argument("--descending", action="store_true", help="Force descending sort (useful if a custom stat where higher is better)")
-    gname = p.add_argument_group("Naming / renaming")
-    gname.add_argument("--bestk-prefix", default="", help="String to prepend to all emitted best-K filenames (e.g., 'chimps_')")
-    gname.add_argument("--label-template", default="{prefix}bestK_K{K}", help="Filename label template. Available fields: {prefix}, {K}")
-    gname.add_argument("--dir-name", default=None, help="If set, override the outdir's leaf name used in labels; does not change file system path")
-    p.add_argument("--overwrite", action="store_true", help="Overwrite existing files in outdir")
-    p.add_argument("--dry-run", action="store_true", help="Only report what would be done")
-    return p.parse_args()
+def run_cmd(cmd, log_path=None):
+    """Run a command; if log_path is provided, stderr goes to that file."""
+    if log_path:
+        with open(log_path, "w") as lf:
+            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=lf,
+                                  check=False, text=True)
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          check=False, text=True)
 
-def discover_Ks(indir, k_list, k_min, k_max):
-    if k_list:
-        return sorted({int(x.strip()) for x in k_list.split(",") if x.strip()})
-    # infer from filenames like *K5*.*
-    ks = set()
-    for path in Path(indir).rglob("*"):
-        if path.is_file():
-            m = re.search(r"[^\w]K(\d+)[^\w]", f"_{path.name}_")
-            if m:
-                ks.add(int(m.group(1)))
-    if k_min is not None:
-        ks = {k for k in ks if k >= k_min}
-    if k_max is not None:
-        ks = {k for k in ks if k <= k_max}
-    return sorted(ks)
+def run_ngsadmix(beagle_file, min_k, max_k, threads, replicates, outdir):
+    basename = os.path.basename(beagle_file).replace(".beagle.gz", "")
+    os.makedirs(outdir, exist_ok=True)
+    rows = []
 
-def extract_numbers_from_log(log_path, stat_key):
-    pats = LOG_PATTERNS[stat_key]
-    vals = []
-    try:
-        with open(log_path, "r", errors="ignore") as fh:
-            for line in fh:
-                for pat in pats:
-                    m = pat.search(line)
+    for k in range(min_k, max_k + 1):
+        for rep in range(1, replicates + 1):
+            outprefix = f"{outdir}/{basename}.K{k}.rep{rep}"
+            log_file  = f"{outprefix}.log"
+            print(f"[NGSadmix] K={k} rep={rep}")
+            cmd = [
+                "NGSadmix", "-likes", beagle_file,
+                "-K", str(k),
+                "-P", str(threads),
+                "-printInfo", "1",
+                "-o", outprefix
+            ]
+            run_cmd(cmd, log_path=log_file)
+
+            # Parse the final likelihood from the log (last line containing "like=")
+            logl = None
+            try:
+                with open(log_file) as fh:
+                    lines = fh.readlines()
+                like_lines = [ln for ln in lines if "like=" in ln]
+                if like_lines:
+                    m = re.search(r'like=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', like_lines[-1])
                     if m:
-                        try:
-                            vals.append(float(m.group(1)))
-                        except ValueError:
-                            pass
-    except Exception:
-        pass
-    return vals
+                        logl = float(m.group(1))
+            except Exception as e:
+                print(f"[warn] Could not parse likelihood from {log_file}: {e}")
 
-def score_K(indir, Ks, log_glob, stat, aggregate):
-    # collect per-K values
-    scores = {}
-    for k in Ks:
-        vals = []
-        # prefer files that explicitly include K<k> in name
-        pri = list(Path(indir).rglob(f"*K{k}*"))
-        logs = [p for p in pri if p.is_file() and p.match(log_glob)]
-        # if none, fall back to any logs in indir
-        if not logs:
-            logs = [p for p in Path(indir).rglob(log_glob) if p.is_file()]
-        for lg in logs:
-            v = extract_numbers_from_log(lg, stat)
-            vals.extend(v)
-        if not vals:
-            # no values found; give None to skip later
-            scores[k] = None
+            rows.append((k, rep, logl, beagle_file))
+
+    df = pd.DataFrame(rows, columns=["K", "rep", "logL", "beagle_file"])
+    df.to_csv(f"{outdir}/likelihoods.tsv", sep="\t", index=False)
+    return df
+
+def evanno_method(df, outdir, multispecies=False):
+    means = df.groupby("K")["logL"].mean()
+    sds   = df.groupby("K")["logL"].std()
+
+    if means.index.size == 0:
+        print("[evanno] No likelihoods available.")
+        pd.DataFrame(columns=["K","DeltaK"]).to_csv(f"{outdir}/evanno_deltaK.tsv", sep="\t", index=False)
+        return [], pd.DataFrame(columns=["K","DeltaK"])
+
+    delta_k = []
+    k_min, k_max = int(min(means.index)), int(max(means.index))
+    for k in range(k_min + 1, k_max):
+        l_km1 = means.get(k - 1, np.nan)
+        l_k   = means.get(k,     np.nan)
+        l_kp1 = means.get(k + 1, np.nan)
+        sd_k  = sds.get(k,       np.nan)
+        if np.all(pd.notna([l_km1, l_k, l_kp1, sd_k])) and sd_k > 0:
+            delta_k.append((k, abs(l_kp1 - 2*l_k + l_km1) / sd_k))
+
+    delta_df = pd.DataFrame(delta_k, columns=["K","DeltaK"])
+    delta_df.to_csv(f"{outdir}/evanno_deltaK.tsv", sep="\t", index=False)
+
+    if delta_df.empty:
+        print("[evanno] Insufficient data for DeltaK (need at least K-1, K, K+1 with nonzero SD).")
+        return [], delta_df
+
+    if multispecies:
+        best_ks = delta_df.sort_values("DeltaK", ascending=False).head(5)["K"].astype(int).tolist()
+        print(f"[evanno] Top ΔK (multi): {best_ks}")
+    else:
+        best_ks = [int(delta_df.loc[delta_df["DeltaK"].idxmax(), "K"])]
+        print(f"[evanno] Best K = {best_ks[0]}")
+    return best_ks, delta_df
+
+def extract_best_artifacts(outdir, df_likelihoods, best_ks, output_prefix="bestQ"):
+    """
+    For each K in best_ks, find the replicate with the highest logL and copy:
+      - {basename}.K{K}.rep{rep}.qopt   -> {output_prefix}.K{K}.qopt
+      - {basename}.K{K}.rep{rep}.fopt.gz-> {output_prefix}.K{K}.fopt.gz
+      - {basename}.K{K}.rep{rep}.filter -> {output_prefix}.K{K}.filter
+    Returns a list of destination file paths successfully written.
+    """
+    saved = []
+    if df_likelihoods.empty or not best_ks:
+        return saved
+
+    basename = os.path.basename(df_likelihoods["beagle_file"].iloc[0]).replace(".beagle.gz", "")
+    for k in sorted(set(best_ks)):
+        subset = df_likelihoods[(df_likelihoods["K"] == k) & df_likelihoods["logL"].notna()]
+        if subset.empty:
+            print(f"[save] No logL for K={k}; skip copying artifacts")
             continue
-        if aggregate == "mean":
-            agg = statistics.fmean(vals)
-        elif aggregate == "median":
-            agg = statistics.median(vals)
-        elif aggregate == "min":
-            agg = min(vals)
-        elif aggregate == "max":
-            agg = max(vals)
-        elif aggregate == "last":
-            agg = vals[-1]
-        scores[k] = agg
-    return scores
 
-def choose_best(scores, stat, n_best, force_desc=False):
-    # Filter out None
-    items = [(k,v) for k,v in scores.items() if v is not None]
-    if not items:
-        return []
-    # Lower is better for CV; higher is better for LLH
-    reverse = (stat == "llh")
-    if force_desc:
-        reverse = True
-    items.sort(key=lambda kv: kv[1], reverse=reverse)
-    return [k for k,_ in items[:n_best]]
+        rep = int(subset.loc[subset["logL"].idxmax(), "rep"])
+        base = os.path.join(outdir, f"{basename}.K{k}.rep{rep}")
+        srcs = {
+            ".qopt":     f"{base}.qopt",
+            ".fopt.gz":  f"{base}.fopt.gz",
+            ".filter":   f"{base}.filter",
+        }
+        dsts = {
+            ".qopt":     os.path.join(outdir, f"{output_prefix}.K{k}.qopt"),
+            ".fopt.gz":  os.path.join(outdir, f"{output_prefix}.K{k}.fopt.gz"),
+            ".filter":   os.path.join(outdir, f"{output_prefix}.K{k}.filter"),
+        }
 
-def most_recent(paths):
-    if not paths:
-        return None
-    paths = sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
-    return paths[0]
+        for ext, src in srcs.items():
+            dst = dsts[ext]
+            try:
+                if os.path.exists(src):
+                    shutil.copyfile(src, dst)
+                    print(f"[save] Best {ext} for K={k} (rep={rep}) → {dst}")
+                    saved.append(dst)
+                else:
+                    print(f"[save] Missing {src} (skipping)")
+            except Exception as e:
+                print(f"[warn] Failed to copy {src} → {dst}: {e}")
 
-def find_artifacts_for_K(indir, K):
-    # try common layouts
-    patterns = [
-        f"*K{K}*.fopt", f"*K{K}*.filter",
-        f"K{K}/*.fopt", f"K{K}/*.filter",
-        f"*K{K}*/*.fopt", f"*K{K}*/*.filter",
-    ]
-    fopt_candidates, filt_candidates = [], []
-    for pat in patterns:
-        for p in Path(indir).rglob(pat):
-            if p.suffix == ".fopt":
-                fopt_candidates.append(p)
-            elif p.suffix == ".filter" or p.name.endswith(".filter"):
-                filt_candidates.append(p)
-    return most_recent(fopt_candidates), most_recent(filt_candidates)
+    return saved
+
 
 def main():
-    args = parse_args()
-    indir = Path(args.indir).resolve()
-    outdir = Path(args.outdir).resolve()
-    outdir.mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser(
+        description="NGSadmix K scan with Evanno best-K and best .qopt extraction (no ADMIXTURE)."
+    )
+    # Short-hand flags
+    ap.add_argument("-b","--beagle", required=True, help="Input .beagle.gz for NGSadmix")
+    ap.add_argument("-i","--minK", type=int, default=1, help="Minimum K (default: 1)")
+    ap.add_argument("-k","--maxK", type=int, required=True, help="Maximum K")
+    ap.add_argument("-t","--threads", type=int, default=4, help="Threads (default: 4)")
+    ap.add_argument("-r","--reps", type=int, default=3, help="Replicates per K for NGSadmix (default: 3)")
+    ap.add_argument("-o","--outdir", default="NGSadmix_runs", help="Output directory (default: NGSadmix_runs)")
+    ap.add_argument("-m","--multispecies", action="store_true",
+                    help="Evanno multi-species mode: report top ΔK values (top 5)")
 
-    Ks = discover_Ks(indir, args.k_list, args.k_min, args.k_max)
-    if not Ks:
-        print("ERROR: Could not infer any K values. Provide --k-list or ensure filenames contain 'K<k>'.", file=sys.stderr)
-        sys.exit(2)
+    args = ap.parse_args()
 
-    scores = score_K(indir, Ks, args.log_glob, args.stat, args.aggregate)
-    bestKs = choose_best(scores, args.stat, args.n_best, force_desc=args.descending)
-    if not bestKs:
-        print("ERROR: Failed to compute scores for any K. Do your logs include CV error or log-likelihood?", file=sys.stderr)
-        sys.exit(3)
+    if args.minK < 1 or args.maxK < args.minK:
+        raise SystemExit(f"[error] Invalid K range: minK={args.minK}, maxK={args.maxK}")
 
-    # write a summary
-    summary_path = outdir / "bestK_summary.tsv"
-    with open(summary_path, "w") as fh:
-        print("#time", "K", "score", "stat", "aggregate", sep="\t", file=fh)
-        now = datetime.datetime.now().isoformat(timespec="seconds")
-        for k in sorted(scores):
-            print(now, k, scores[k] if scores[k] is not None else "NA", args.stat, args.aggregate, sep="\t", file=fh)
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # Copy artifacts
-    emitted = []
-    for k in bestKs:
-        label = args.label_template.format(prefix=args.bestk_prefix, K=k)
-        fopt_src, filt_src = find_artifacts_for_K(indir, k)
-        if not fopt_src and not filt_src:
-            print(f"WARNING: No .fopt or .filter found for K={k}. Skipping copy.", file=sys.stderr)
-            continue
-        if fopt_src:
-            dst = outdir / f"{label}.fopt"
-            if dst.exists() and not args.overwrite:
-                print(f"NOTE: {dst} exists; use --overwrite to replace.", file=sys.stderr)
-            elif not args.dry_run:
-                shutil.copy2(fopt_src, dst)
-            emitted.append(("fopt", k, str(fopt_src), str(dst)))
-        if filt_src:
-            dst = outdir / f"{label}.filter"
-            if dst.exists() and not args.overwrite:
-                print(f"NOTE: {dst} exists; use --overwrite to replace.", file=sys.stderr)
-            elif not args.dry_run:
-                shutil.copy2(filt_src, dst)
-            emitted.append(("filter", k, str(filt_src), str(dst)))
+    # NGSadmix + Evanno
+    df = run_ngsadmix(args.beagle, args.minK, args.maxK, args.threads, args.reps, args.outdir)
+    evanno_best_ks, _ = evanno_method(df, args.outdir, multispecies=args.multispecies)
 
-    # Emit manifest
-    manifest = outdir / "bestK_manifest.tsv"
-    with open(manifest, "w") as fh:
-        print("type", "K", "source", "dest", sep="\t", file=fh)
-        for row in emitted:
-            print(*row, sep="\t", file=fh)
+    # Save summary bestK.txt (Evanno only)
+    bestk_path = os.path.join(args.outdir, "bestK.txt")
+    with open(bestk_path, "w") as f:
+        if evanno_best_ks:
+            f.write(f"Evanno:{','.join(map(str, evanno_best_ks))}\n")
+        else:
+            f.write("Evanno:\n")
+    print(f"[write] {bestk_path}")
 
-    # Report
-    print(f"[bestK] Candidates scored: {', '.join(map(str, Ks))}")
-    print(f"[bestK] Best K(s): {', '.join(map(str, bestKs))}  (stat={args.stat}, agg={args.aggregate})")
-    print(f"[bestK] Summary: {summary_path}")
-    print(f"[bestK] Manifest: {manifest}")
-    if emitted:
-        print(f"[bestK] Copied {len(emitted)} artifact(s) into {outdir}")
-    else:
-        print(f"[bestK] No artifacts copied; check warnings above.")
+    # Copy best .qopt for any chosen K from Evanno
+    extract_best_q_matrices(args.outdir, df, evanno_best_ks)
+
+    print(f"[done] Outputs in: {args.outdir}/")
 
 if __name__ == "__main__":
     main()
