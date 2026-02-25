@@ -147,7 +147,7 @@ def parse_flagstat(flagstat_file: str):
         lines = f.readlines()
     try:
         total_reads = int(lines[0].split()[0])
-        mapped_reads = int(lines[4].split()[0])
+        mapped_reads = int(lines[6].split()[0])
         mapped_percent = (mapped_reads / total_reads * 100.0) if total_reads > 0 else np.nan
     except (IndexError, ValueError):
         total_reads = np.nan
